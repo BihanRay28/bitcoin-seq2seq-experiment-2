@@ -1,0 +1,4 @@
+# Paths resolve relative to this file, not the terminal's current directory.
+# For a standalone clone, edit these two paths to your local dataset/output root.
+dataset_path = '../datasets/BTC_USDT_30m_Binance_20260913_184821.csv'
+output_root = '../outputs'

@@ -1,0 +1,53 @@
+# TOML syntax. This is the single source of numerical run settings.
+[contract]
+context_length = 48
+horizon = 12
+input_size = 5
+candle_minutes = 30
+
+[data]
+train_stride = 1
+eval_stride = 12
+test_fraction = 0.10
+n_folds = 5
+threshold_quantile = 0.33
+epsilon = 1e-8
+volatility_ddof = 0
+
+[model]
+encoder_hidden_size = 128
+decoder_hidden_size = 128
+num_layers = 2
+attention_dim = 128
+head_hidden_size = 64
+dropout = 0.2
+
+[training]
+learning_rate = 0.001
+weight_decay = 0.0001
+batch_size = 64
+gradient_clip = 1.0
+smooth_l1_beta = 1.0
+seed = 42
+head_seed_offset = 10000
+teacher_seed_offset = 20000
+device = "auto"
+# auto disables cuDNN on Windows/Python >=3.14 to avoid a native RNN shutdown crash.
+# CUDA remains active; "enabled"/"disabled" explicitly override the compatibility rule.
+cudnn_policy = "auto"
+num_workers = 0
+pin_memory = false
+cpu_threads = 4
+teacher_probabilities = [1.0, 0.75, 0.50, 0.25, 0.0]
+stage_max_epochs = [20, 20, 20, 20, 20]
+stage_patience = [3, 3, 3, 3, 3]
+zero_stage_min_epochs = 5
+min_delta = 0.0001
+calibration_batches = 32
+return_contribution = 0.5
+trend_contribution = 0.25
+
+[smoke]
+smoke_train_samples = 128
+smoke_eval_samples = 32
+smoke_stage_epochs = 1
