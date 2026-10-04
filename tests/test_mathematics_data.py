@@ -2,8 +2,9 @@ import numpy as np
 import pytest
 import torch
 
-from data import CandleWindows, Standardizer, chronological_split, fold_datasets, load_dataset
-from main import configure_backend, load_configuration, validate_configuration
+from data import CandleWindows, Standardizer, chronological_split, class_distribution, final_datasets, fold_datasets, load_dataset
+from main import HERE, configure_backend, load_configuration, validate_configuration, validate_paths
+from output import persistence_forecast
 from transforms import (historical_volatility, log_returns, reconstruct_ohlcv, transform_ohlcv,
                         trend_labels, six_hour_normalized_return)
 
@@ -111,6 +112,62 @@ def test_relative_paths_not_cwd(tmp_path,monkeypatch):
     monkeypatch.chdir(tmp_path)
     _,paths=load_configuration()
     assert paths['dataset_path'].name=='BTC_USDT_30m_Binance_20260913_184821.csv'
+
+
+@pytest.mark.parametrize('syntax',[
+    "dataset_path = 'D:\\!Papers\\FinanceBot\\dataset.csv'\noutput_root = 'D:\\!Papers\\FinanceBot\\outputs'",
+    'dataset_path = "D:/!Papers/FinanceBot/dataset.csv"\noutput_root = "D:/!Papers/FinanceBot/outputs"',
+])
+def test_windows_toml_paths(tmp_path,syntax):
+    import tomllib
+    from pathlib import PureWindowsPath
+    path=tmp_path/'paths.txt';path.write_text(syntax,encoding='utf-8')
+    parsed=tomllib.loads(syntax)
+    assert PureWindowsPath(parsed['dataset_path'])==PureWindowsPath('D:/!Papers/FinanceBot/dataset.csv')
+    _,resolved=load_configuration(HERE/'hyperparameters.txt',path)
+    if __import__('os').name=='nt':
+        assert PureWindowsPath(resolved['dataset_path'])==PureWindowsPath(parsed['dataset_path'])
+    else:
+        assert 'dataset.csv' in str(resolved['dataset_path'])
+
+
+def test_configuration_paths_validation(tmp_path):
+    import tomllib
+    path=tmp_path/'paths.txt';path.write_text('dataset_path = 123\noutput_root = "outputs"')
+    with pytest.raises(ValueError,match='strings'):load_configuration(paths=path)
+    path.write_text('dataset_path = ""\noutput_root = "outputs"')
+    with pytest.raises(ValueError,match='strings'):load_configuration(paths=path)
+    with pytest.raises(tomllib.TOMLDecodeError):tomllib.loads('dataset_path = "D:\\!Papers\\data.csv"')
+    with pytest.raises(ValueError,match='existing'):validate_paths({'dataset_path':tmp_path/'missing.csv','output_root':tmp_path/'outputs'})
+    dataset=tmp_path/'data.csv';dataset.write_text('placeholder')
+    with pytest.raises(ValueError,match='directory'):validate_paths({'dataset_path':dataset,'output_root':dataset/'outputs'})
+    validate_paths({'dataset_path':dataset,'output_root':tmp_path/'outputs'})
+
+
+def test_final_scaler_threshold_and_class_reports_ignore_test(frame,cfg):
+    dev,_=chronological_split(len(frame),cfg);train,test=final_datasets(frame,dev,cfg)
+    changed=frame.copy()
+    changed.loc[dev:,['open','high','low','close']]*=3
+    changed.loc[dev:,'volume']*=100
+    train2,test2=final_datasets(changed,dev,cfg)
+    torch.testing.assert_close(train.scaler.mean,train2.scaler.mean)
+    torch.testing.assert_close(train.scaler.scale,train2.scaler.scale)
+    assert train.threshold==train2.threshold==test2.threshold and test.scaler is train.scaler
+    assert class_distribution(train)==class_distribution(train2)
+    for partition in (train,test):
+        distribution=class_distribution(partition)
+        assert sum(distribution['counts'])==len(partition)*12
+        assert sum(distribution['proportions'])==pytest.approx(1.)
+
+
+def test_persistence_uses_observed_candles_only(frame,cfg):
+    ds=CandleWindows(frame,0,600,cfg,1);window=ds[0]
+    observed=window['raw_context'].numpy()[None]
+    original=persistence_forecast(observed,12)
+    window['raw_target'].mul_(20)  # Target mutation cannot enter baseline's API.
+    np.testing.assert_array_equal(original,persistence_forecast(observed,12))
+    np.testing.assert_array_equal(original[0,:,:4],np.full((12,4),observed[0,-1,3]))
+    np.testing.assert_array_equal(original[0,:,4],np.full(12,observed[0,-1,4]))
 
 
 def test_windows_314_compatibility_is_explicit(cfg,monkeypatch):

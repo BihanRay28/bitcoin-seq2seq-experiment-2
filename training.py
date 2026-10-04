@@ -4,6 +4,8 @@ from __future__ import annotations
 import math
 import random
 import time
+import statistics
+from itertools import islice
 import numpy as np
 import torch
 from torch.nn import functional as F
@@ -20,6 +22,32 @@ def seed_everything(seed):
 
 def make_optimizer(model, cfg):
     return torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+
+
+def final_stage_durations(fold_best_epochs, stage_count, expected_folds):
+    """Select stage-local BEST epochs, never patience stopping durations."""
+    if len(fold_best_epochs) != expected_folds or any(len(row) != stage_count for row in fold_best_epochs):
+        raise ValueError('Need one best epoch per stage for every completed fold')
+    if any(type(e) is not int or e < 1 for row in fold_best_epochs for e in row):
+        raise ValueError('Stage best epochs must be positive integers')
+    return [math.ceil(statistics.median(row[s] for row in fold_best_epochs)) for s in range(stage_count)]
+
+
+def global_gradient_norm(model):
+    """Explicit L2 measurement; do not infer it from the clipping return value."""
+    norms = [p.grad.detach().norm() for p in model.parameters() if p.grad is not None]
+    return torch.linalg.vector_norm(torch.stack(norms)) if norms else torch.tensor(0.)
+
+
+def calibrate_temporary(scaler, loader, cfg, device):
+    from model import seq2seq_model
+    seed = cfg.seed + cfg.calibration_seed_offset
+    # This temporary model and private sequential loader are never reused by fit.
+    # Preserve CPU/CUDA RNG even if future calibration internals introduce draws.
+    devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+    with torch.random.fork_rng(devices=devices):
+        model = seq2seq_model(cfg, scaler, '2B', initialization_seed=seed).to(device)
+        return calibrate(model, loader, cfg, device)
 
 
 def losses(model, result, batch, cfg, weights):
@@ -41,19 +69,27 @@ def calibrate(model, loader, cfg, device):
     if model.experiment == '2A':
         return {'return': 0.0, 'trend': 0.0, 'calibration': None}
     model.eval(); sums = {key: 0.0 for key in ('base', 'return', 'trend')}; count = 0
+    batch_identifiers = []
     with torch.no_grad():
-        for i, batch in enumerate(loader):
-            if i >= cfg.calibration_batches: break
+        for batch in islice(loader, cfg.calibration_batches):
             context = batch['context'].to(device)
             values = losses(model, model(context), batch, cfg, {'return': 1., 'trend': 1.})
             for key in sums: sums[key] += float(values[key]) * len(context)
             count += len(context)
+            batch_identifiers.append(batch['origin_index'].tolist())
     if not count: raise ValueError('No training calibration samples')
     means = {key: value / count for key, value in sums.items()}
     if not all(math.isfinite(x) for x in means.values()): raise FloatingPointError('Nonfinite calibration')
-    return {'return': cfg.return_contribution * means['base'] / max(means['return'], cfg.epsilon),
-            'trend': cfg.trend_contribution * means['base'] / max(means['trend'], cfg.epsilon),
-            'calibration': {'samples': count, 'batches_limit': cfg.calibration_batches, 'means': means}}
+    lambda_r = cfg.return_contribution * means['base'] / max(means['return'], cfg.epsilon)
+    lambda_c = cfg.trend_contribution * means['base'] / max(means['trend'], cfg.epsilon)
+    return {'return': lambda_r, 'trend': lambda_c,
+            'calibration': {'samples': count, 'batches_limit': cfg.calibration_batches, 'means': means,
+                            'm_base': means['base'], 'm_return': means['return'], 'm_trend': means['trend'],
+                            'lambda_r': lambda_r, 'lambda_c': lambda_c,
+                            'calibration_seed': model.initialization_seed,
+                            'number_of_batches': len(batch_identifiers),
+                            'batch_origin_indices': batch_identifiers,
+                            'teacher_forcing': 0., 'optimization_steps': 0}}
 
 
 @torch.no_grad()
@@ -94,8 +130,9 @@ def train_epoch(model, loader, optimizer, cfg, weights, device, probability, gen
         values = losses(model, result, batch, cfg, weights)
         if not all(torch.isfinite(v) for v in values.values()): raise FloatingPointError('Nonfinite training loss')
         values['total'].backward(); collector.add(model)
-        norm_before = float(torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.gradient_clip, error_if_nonfinite=True))
-        norm_after = float(torch.linalg.vector_norm(torch.stack([p.grad.norm() for p in model.parameters() if p.grad is not None])))
+        norm_before = float(global_gradient_norm(model))
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.gradient_clip, error_if_nonfinite=True)
+        norm_after = float(global_gradient_norm(model))
         optimizer.step()
         for key in sums: sums[key] += float(values[key].detach()) * len(context)
         count += len(context); batches += 1; before_sum += norm_before; after_sum += norm_after
@@ -124,7 +161,7 @@ def fit(model, train_loader, valid_loader, cfg, weights, device, threshold, dire
     history, gradients, durations, selected_stage_epochs = [], [], [], []; epoch = 0
     for stage, probability in enumerate(cfg.teacher_probabilities):
         cap = fixed_durations[stage] if fixed_durations is not None else cfg.stage_max_epochs[stage]
-        patience = cfg.stage_patience[stage]; best = float('inf'); stale = 0; best_stage_epoch = 0
+        patience = cfg.stage_patience[stage]; best = patience_best = float('inf'); stale = 0; best_stage_epoch = 0
         stage_checkpoint = folder / f'stage_{stage+1:02d}_best.pt'
         tqdm.write(f'{label}: stage {stage+1}, teacher forcing={probability}, cap={cap}, patience={patience}')
         for stage_epoch in range(1, cap + 1):
@@ -133,7 +170,8 @@ def fit(model, train_loader, valid_loader, cfg, weights, device, threshold, dire
                                                       probability, generator, f'{label} S{stage+1} E{epoch}')
             record = {'epoch': epoch, 'stage': stage, 'stage_epoch': stage_epoch, 'teacher_forcing': probability,
                       'learning_rate': optimizer.param_groups[0]['lr'], **{f'train_{k}': v for k, v in values.items()},
-                      'gradient_norm_before': before, 'gradient_norm_after': after}
+                      'gradient_norm_before': before, 'gradient_norm_after': after,
+                      'pre_clip_global_norm': before, 'post_clip_global_norm': after}
             if valid_loader is not None:
                 metrics, _ = evaluate(model, valid_loader, cfg, weights, device, threshold)
                 record.update({f'validation_{k}': v for k, v in metrics['losses'].items()})
@@ -146,10 +184,14 @@ def fit(model, train_loader, valid_loader, cfg, weights, device, threshold, dire
                     record.update({'validation_head_accuracy': metrics['classification_head']['accuracy'],
                                    'validation_head_macro_f1': metrics['classification_head']['macro_f1']})
                 score = metrics['losses']['total']
-                if score < best - cfg.min_delta:
-                    best = score; stale = 0; best_stage_epoch = stage_epoch
+                if score < best:
+                    best = score; best_stage_epoch = stage_epoch
                     torch.save(checkpoint(model, optimizer, cfg, weights, threshold, epoch, stage, stage_epoch), stage_checkpoint)
+                if score < patience_best - cfg.min_delta:
+                    patience_best = score; stale = 0
                 else: stale += 1
+            record['stage_best_epoch'] = best_stage_epoch if valid_loader is not None else None
+            record['stage_stop_epoch'] = None
             record['stale_epochs'] = stale; record['seconds'] = time.perf_counter() - started
             history.append(record); gradients.append({'epoch': epoch, 'stage': stage, 'parameters': stats})
             # Incremental histories survive interruptions; plots are generated at fit completion.
@@ -158,15 +200,27 @@ def fit(model, train_loader, valid_loader, cfg, weights, device, threshold, dire
             minimum = cfg.zero_stage_min_epochs if probability == 0 else 1
             if fixed_durations is None and stage_epoch >= minimum and stale >= patience: break
         durations.append(stage_epoch); selected_stage_epochs.append(best_stage_epoch if valid_loader is not None else stage_epoch)
+        # Persist final stage decisions on every record in that stage. The
+        # minimum zero-forcing duration constrains CV stopping, not the median
+        # BEST-epoch final fit, which must not be silently padded to five.
+        for row in history:
+            if row['stage'] == stage:
+                row['stage_best_epoch'] = best_stage_epoch if valid_loader is not None else None
+                row['stage_stop_epoch'] = stage_epoch
+        write_json(folder / 'epochs.json', history)
         if valid_loader is not None:
             restored = restore(stage_checkpoint, model, optimizer, device)
             tqdm.write(f'{label}: restored stage {stage+1} epoch {restored["stage_epoch"]}; completed {stage_epoch} epochs')
     selected = (restored if valid_loader is not None else
                 checkpoint(model, optimizer, cfg, weights, threshold, epoch, len(durations)-1, selected_stage_epochs[-1]))
     selected['selected_stage_epochs'] = selected_stage_epochs
+    selected['stage_best_epoch'] = selected_stage_epochs if valid_loader is not None else None
+    selected['stage_stop_epoch'] = durations
     selected['epochs_executed'] = epoch
     torch.save(selected, folder / ('best_checkpoint.pt' if valid_loader is not None else 'final_checkpoint.pt'))
     save_history(history, gradients, directories, label)
     write_json(folder / 'fit_summary.json', {'stage_durations': durations, 'selected_stage_epochs': selected_stage_epochs,
-                                            'epochs_executed': epoch, 'selection': 'best zero-forcing stage' if valid_loader is not None else 'fixed median fold durations'})
-    return durations, history
+                                            'stage_best_epoch': selected_stage_epochs if valid_loader is not None else None,
+                                            'stage_stop_epoch': durations,
+                                            'epochs_executed': epoch, 'selection': 'best zero-forcing stage' if valid_loader is not None else 'fixed median fold best epochs'})
+    return selected_stage_epochs, history

@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 from transforms import (fit_threshold, historical_volatility, log_returns,
                         normalized_returns, transform_ohlcv, trend_labels)
@@ -130,9 +130,19 @@ def final_datasets(frame, dev_end, cfg):
 
 
 def loader(dataset, cfg, shuffle=False, seed=None):
-    generator = torch.Generator().manual_seed(cfg.seed if seed is None else seed)
+    generator = torch.Generator().manual_seed(cfg.seed + cfg.shuffle_seed_offset if seed is None else seed)
     return DataLoader(dataset, batch_size=cfg.batch_size, shuffle=shuffle,
                       num_workers=cfg.num_workers, pin_memory=cfg.pin_memory, generator=generator)
+
+
+def class_distribution(dataset):
+    """Counts/proportions across forecast target labels, including window overlap."""
+    labels = (dataset.dataset.labels[list(dataset.indices)] if isinstance(dataset, Subset) else dataset.labels)
+    counts = torch.bincount(labels.flatten(), minlength=3).tolist()
+    total = sum(counts)
+    return {'class_order': ['Bear', 'Neutral', 'Bull'], 'counts': counts,
+            'proportions': [n / total if total else 0. for n in counts],
+            'target_labels': total, 'windows': len(dataset)}
 
 
 def describe_split(frame, cfg):

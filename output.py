@@ -18,6 +18,24 @@ from transforms import (log_returns, reconstruct_ohlcv, normalized_returns,
                         six_hour_normalized_return, trend_labels)
 
 CLASSES = ["Bear", "Neutral", "Bull"]
+PERSISTENCE_DEFINITION = {
+    'open': 'last observed close C_t at every forecast step',
+    'high': 'last observed close C_t at every forecast step',
+    'low': 'last observed close C_t at every forecast step',
+    'close': 'last observed close C_t at every forecast step',
+    'volume': 'last observed volume V_t at every forecast step',
+    'log_returns': 'zero at every step; six-hour cumulative return is zero',
+    'trend': 'Neutral (class 1) at every step',
+}
+
+
+def persistence_forecast(raw_context, horizon):
+    """Causal baseline: takes observed candles only, never future targets."""
+    context = np.asarray(raw_context)
+    forecast = np.empty((len(context), horizon, 5), dtype=context.dtype)
+    forecast[..., :4] = context[:, -1, 3, None, None]
+    forecast[..., 4] = context[:, -1, 4, None]
+    return forecast
 
 
 def write_json(path, value):
@@ -54,7 +72,10 @@ def classification_matrix(cm):
     return {"accuracy": float(cm.trace() / max(1, cm.sum())), "macro_f1": float(f1.mean()),
             "balanced_accuracy": float(recall[support > 0].mean()) if (support > 0).any() else 0.0,
             "confusion_matrix": cm.tolist(), "actual_class_counts": support.tolist(),
-            "predicted_class_counts": predicted_count.tolist(), "per_class_f1": f1.tolist()}
+            "predicted_class_counts": predicted_count.tolist(), "per_class_f1": f1.tolist(),
+            "class_order": CLASSES,
+            "actual_class_proportions": (support / max(1, support.sum())).tolist(),
+            "predicted_class_proportions": (predicted_count / max(1, predicted_count.sum())).tolist()}
 
 
 def regression(actual, predicted):
@@ -77,9 +98,8 @@ def forecast_metrics(arrays, threshold, cfg):
     denominator = sigma * np.sqrt(cfg.horizon) + cfg.epsilon
     metrics["six_hour_trend"] = classification(labels(ar.sum(1) / denominator), labels(pr.sum(1) / denominator))
     predicted_raw, actual_raw = arrays["raw_predictions"], arrays["raw_targets"]
-    persistence = np.zeros_like(actual_raw)
-    persistence[..., :4] = arrays["reference_close"][:, None, None]
-    persistence[..., 4] = arrays["raw_context"][:, -1, 4, None]
+    persistence = persistence_forecast(arrays['raw_context'], cfg.horizon)
+    metrics['persistence_definition'] = PERSISTENCE_DEFINITION
     metrics["ohlcv"] = {name: regression(actual_raw[..., i], predicted_raw[..., i])
                         for i, name in enumerate(("open", "high", "low", "close", "volume"))}
     metrics["persistence_ohlcv"] = {name: regression(actual_raw[..., i], persistence[..., i])
@@ -284,10 +304,14 @@ class GradientHistory:
             entry = self.entries[name]
             item = {"parameter": dict(zip(("mean", "std", "min", "max", "norm"), weight)),
                     "batches": entry['batches'], "missing_gradient_batches": entry['missing'], "gradient": None}
+            item['missing_gradient_status'] = ('all' if entry['missing'] == entry['batches'] else
+                                               'some' if entry['missing'] else 'none')
             if entry['stats'] is not None:
                 total, squares, lo, hi, norms, count = entry['stats'].cpu().tolist()
                 mean = total / count
                 item['gradient'] = {"mean": mean, "std": float(np.sqrt(max(0, squares / count - mean*mean))),
-                                    "min": lo, "max": hi, "mean_batch_norm": norms / (entry['batches'] - entry['missing'])}
+                                    "min": lo, "max": hi, "mean_batch_norm": norms / (entry['batches'] - entry['missing']),
+                                    "norm": float(np.sqrt(squares)),
+                                    "norm_definition": 'L2 norm pooled over pre-clipping gradients of all present batches'}
             result[name] = item
         return result

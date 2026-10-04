@@ -31,6 +31,8 @@ smooth_l1_beta = 1.0
 seed = 42
 head_seed_offset = 10000
 teacher_seed_offset = 20000
+shuffle_seed_offset = 30000
+calibration_seed_offset = 40000
 device = "auto"
 # auto disables cuDNN on Windows/Python >=3.14 to avoid a native RNN shutdown crash.
 # CUDA remains active; "enabled"/"disabled" explicitly override the compatibility rule.
